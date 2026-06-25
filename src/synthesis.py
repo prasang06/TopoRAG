@@ -8,22 +8,25 @@ SYSTEM_PROMPT = """You are an expert research assistant specializing in computat
 Your task is to synthesize a rigorously cited, hallucination-free literature review based ONLY on the provided extracted context.
 
 CRITICAL INSTRUCTIONS:
-1. NARRATIVE STRUCTURE: You MUST follow a strict chronological/structural narrative. 
-   First, explain the foundational theory from the [STRUCTURAL BOTTLENECK] papers. 
-   Then, discuss the specific applications or developments in the [SEMANTIC HIT] papers.
-2. STRICT CITATIONS: You are strictly forbidden from hallucinating math or equations. 
-   If you include an equation, you MUST cite the specific arXiv ID and the section branch it was pulled from (e.g., "[arXiv:1234.5678, Section: Methodology]").
-3. NO OUTSIDE KNOWLEDGE: Base your entire synthesis ONLY on the provided context. If the context is insufficient, state that."""
+1. NARRATIVE STRUCTURE: You MUST create a separate, numbered step for EVERY SINGLE PAPER provided in the [EXTRACTED CONTEXT]. If there are 10 papers in the context, there must be 10 numbered steps. Do not skip any papers.
+   First, cover the [STRUCTURAL BOTTLENECK] papers. 
+   Then, cover the [SEMANTIC HIT] papers.
+2. EXACT CITATION FORMAT: For each step, provide the paper link on a single line formatted EXACTLY like this:
+   **Read:** [Paper Title Here](https://arxiv.org/abs/1234.5678)
+3. NO INLINE CITATIONS: Do NOT mention the arXiv ID, theorem names, or section names anywhere else in the text. The ONLY place the paper should be cited or linked is in the "**Read:**" line.
+4. NO OUTSIDE KNOWLEDGE: Base your entire synthesis ONLY on the provided context. If the context is insufficient, state that."""
 
 CURRICULUM_PROMPT = """You are an expert research advisor specializing in computational physics and numerical methods.
 Your task is to generate a personalized, sequential reading curriculum for a student embarking on a new research project, based ONLY on the provided extracted context.
 
 CRITICAL INSTRUCTIONS:
-1. SEQUENTIAL SYLLABUS: You MUST structure your response as a numbered, step-by-step reading sequence.
-   - Step 1: Start with the [STRUCTURAL BOTTLENECK] papers to establish foundational and theoretical knowledge. Explain WHY the student must read this first.
-   - Step 2+: Move to the [SEMANTIC HIT] papers to cover specific applications relevant to their project. Explain WHAT they will gain from reading it.
-2. STRICT CITATIONS: If you reference any methodology or equations, you MUST cite the specific arXiv ID and section (e.g., "[arXiv:1234.5678, Section: Methodology]").
-3. NO OUTSIDE KNOWLEDGE: Base your syllabus ONLY on the provided context."""
+1. SEQUENTIAL SYLLABUS: You MUST create a separate, numbered step for EVERY SINGLE PAPER provided in the [EXTRACTED CONTEXT]. If there are 10 papers in the context, there must be 10 numbered steps in your syllabus. Do not skip any papers.
+   - Start with the [STRUCTURAL BOTTLENECK] papers. Explain WHY the student must read this first.
+   - Move to the [SEMANTIC HIT] papers. Explain WHAT they will gain from reading it.
+2. EXACT CITATION FORMAT: For each step, provide the paper link on a single line formatted EXACTLY like this:
+   **Read:** [Paper Title Here](https://arxiv.org/abs/1234.5678)
+3. NO INLINE CITATIONS: Do NOT mention the arXiv ID, theorem names, or section names anywhere else in the text. The ONLY place the paper should be cited or linked is in the "**Read:**" line.
+4. NO OUTSIDE KNOWLEDGE: Base your syllabus ONLY on the provided context."""
 
 class SemanticSynthesizer:
     """
@@ -32,6 +35,52 @@ class SemanticSynthesizer:
     """
     def __init__(self, model: str = "gemma4:31b-cloud"):
         self.model = model
+        
+    def extract_arxiv_query(self, user_query: str) -> str:
+        """
+        Uses the LLM to parse a natural language query into a syntactically correct arXiv boolean search string.
+        """
+        system_prompt = """You are an expert physics research librarian. 
+Your task is to take a user's natural language research question and extract 1 to 3 core concepts, formatting them into an arXiv API search string.
+
+RULES:
+1. Output ONLY the raw search string, nothing else. No preamble, no explanation, no backticks.
+2. Format the string using 'all:' prefix and 'AND' boolean operators.
+3. If a concept is multiple words, enclose that specific concept in quotes.
+4. Keep the concepts broad enough to find papers but specific enough to be relevant. Fix any obvious spelling mistakes in the user's query.
+
+EXAMPLE INPUT: i want to learn about how quantum error correction helps in encoding data into qubits and performing operations leading into arithemetic
+EXAMPLE OUTPUT: all:"quantum error correction" AND all:qubit AND all:arithmetic
+"""
+        print(f"[Synthesizer] Asking Ollama ({self.model}) to extract arXiv search tags...")
+        try:
+            response = ollama.chat(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": f"USER QUERY: {user_query}"}
+                ]
+            )
+            query = response['message']['content'].strip()
+            
+            # Strip markdown code blocks if the LLM disobeyed
+            if query.startswith("```") and query.endswith("```"):
+                query = query.split("\n")[1:-1]
+                query = "".join(query).strip()
+            if query.startswith("`") and query.endswith("`"):
+                query = query[1:-1].strip()
+                
+            if "all:" not in query:
+                print(f"[Synthesizer] Warning: LLM produced invalid query format: {query}. Falling back to default.")
+                fallback = " AND ".join([f'all:"{word}"' for word in user_query.split()[:3]])
+                return fallback
+                
+            print(f"[Synthesizer] Extracted optimal arXiv query: {query}")
+            return query
+        except Exception as e:
+            print(f"[Synthesizer] Failed to extract arXiv query: {e}. Falling back to default.")
+            fallback = " AND ".join([f'all:"{word}"' for word in user_query.split()[:3]])
+            return fallback
         
     def generate_synthesis(self, query: str, formatted_context: str, mode: str = "review") -> str:
         """

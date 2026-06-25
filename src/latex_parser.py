@@ -3,6 +3,7 @@ import tarfile
 import io
 import logging
 import re
+import os
 from typing import Dict, Any, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -10,8 +11,19 @@ logger = logging.getLogger(__name__)
 async def fetch_arxiv_eprint(arxiv_id: str) -> Optional[str]:
     """
     Asynchronously fetches the raw LaTeX e-print tarball from arXiv and extracts the main .tex file.
+    Uses local caching to prevent rate limiting.
     Returns the raw LaTeX string, or None if it fails.
     """
+    cache_dir = ".cache/arxiv_eprint"
+    os.makedirs(cache_dir, exist_ok=True)
+    cache_file = os.path.join(cache_dir, f"{arxiv_id.replace('/', '_')}.tex")
+    
+    # Check cache first
+    if os.path.exists(cache_file):
+        logger.info(f"Cache hit for {arxiv_id}")
+        with open(cache_file, "r", encoding="utf-8", errors="ignore") as f:
+            return f.read()
+
     url = f"https://export.arxiv.org/e-print/{arxiv_id}"
     try:
         async with aiohttp.ClientSession() as session:
@@ -22,6 +34,7 @@ async def fetch_arxiv_eprint(arxiv_id: str) -> Optional[str]:
                 
                 content = await response.read()
                 
+                tex_string = None
                 try:
                     # Attempt to extract tar.gz
                     with tarfile.open(fileobj=io.BytesIO(content), mode="r:gz") as tar:
@@ -30,11 +43,20 @@ async def fetch_arxiv_eprint(arxiv_id: str) -> Optional[str]:
                             if member.name.endswith(".tex"):
                                 f = tar.extractfile(member)
                                 if f is not None:
-                                    return f.read().decode('utf-8', errors='ignore')
+                                    tex_string = f.read().decode('utf-8', errors='ignore')
+                                    break
                 except tarfile.TarError:
                     pass
                 
-                return content.decode('utf-8', errors='ignore')
+                if tex_string is None:
+                    tex_string = content.decode('utf-8', errors='ignore')
+                
+                # Save to cache
+                if tex_string:
+                    with open(cache_file, "w", encoding="utf-8") as f:
+                        f.write(tex_string)
+                        
+                return tex_string
                 
     except Exception as e:
         logger.error(f"Error fetching e-print for {arxiv_id}: {e}")

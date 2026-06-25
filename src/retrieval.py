@@ -145,11 +145,6 @@ class GraphRAGRetrievalEngine:
                 "hybrid_score": sim + self.alpha * bc,
                 "role": role
             }
-            
-            # Stage 2 (Micro): Granular Tree Retrieval
-            if "tree" in p:
-                node_data["relevant_branches"] = self._micro_retrieve_tree(query, p["tree"])
-                
             return node_data
 
         for idx in top_k_indices:
@@ -161,16 +156,42 @@ class GraphRAGRetrievalEngine:
         # Sort the final retrieved nodes by hybrid score to feed the LLM in order of combined relevance
         final_retrieved_nodes.sort(key=lambda x: x["hybrid_score"], reverse=True)
 
-        has_trees = any("relevant_branches" in node for node in final_retrieved_nodes)
+        return {
+            "retrieved_nodes": final_retrieved_nodes
+        }
+
+    def format_payload(self, query: str, retrieved_nodes: List[Dict[str, Any]], original_papers: List[Dict[str, Any]], instruction: str = "") -> Dict[str, Any]:
+        """
+        Formats the retrieved nodes into a markdown payload and JSON data structure.
+        Performs micro-retrieval on the LaTeX trees if they are present in the original_papers.
+        """
+        final_nodes = []
+        semantic_count = sum(1 for n in retrieved_nodes if n["role"] == "Semantic Hit")
+        bridge_count = sum(1 for n in retrieved_nodes if "Bridge" in n["role"])
+        
+        for node in retrieved_nodes:
+            idx = node["idx"]
+            p = original_papers[idx]
+            
+            # Create a copy so we don't mutate the retrieval output
+            node_data = node.copy()
+            
+            # Stage 2 (Micro): Granular Tree Retrieval
+            if "tree" in p:
+                node_data["relevant_branches"] = self._micro_retrieve_tree(query, p["tree"], instruction=instruction)
+            
+            final_nodes.append(node_data)
+            
+        has_trees = any("relevant_branches" in n for n in final_nodes)
         
         if has_trees:
             # Format as JSON payload for LLM consumption
             payload_data = {
                 "metrics": {
-                    "semantic_hits": len(top_k_indices),
-                    "structural_bridges": len(selected_neighbor_indices)
+                    "semantic_hits": semantic_count,
+                    "structural_bridges": bridge_count
                 },
-                "nodes": final_retrieved_nodes
+                "nodes": final_nodes
             }
             payload_markdown = json.dumps(payload_data, indent=2)
         else:
@@ -178,10 +199,10 @@ class GraphRAGRetrievalEngine:
             payload_lines = [
                 "### GRAPH-RAG CONTEXT PAYLOAD",
                 "The following relevant literature and structural bridge papers have been retrieved from the citation network.",
-                f"**Retrieval Metrics**: Semantic Hits: {len(top_k_indices)} | Structural Bridges Injected: {len(selected_neighbor_indices)}\n"
+                f"**Retrieval Metrics**: Semantic Hits: {semantic_count} | Structural Bridges Injected: {bridge_count}\n"
             ]
 
-            for rank, node in enumerate(final_retrieved_nodes, 1):
+            for rank, node in enumerate(final_nodes, 1):
                 role_badge = f"[{node['role'].upper()}]"
                 authors_str = ", ".join(node['authors'])
                 categories_str = ", ".join(node['categories'])
@@ -201,12 +222,13 @@ class GraphRAGRetrievalEngine:
             payload_markdown = "\n".join(payload_lines)
 
         return {
-            "retrieved_nodes": final_retrieved_nodes,
+            "retrieved_nodes": final_nodes,
             "markdown_payload": payload_markdown,
             "payload_data": payload_data if has_trees else None
         }
 
     def _cosine_similarity_text(self, text1: str, text2: str) -> float:
+        """Fallback lexical cosine similarity if SentenceTransformers is not available."""
         vec1 = Counter(text1.lower().split())
         vec2 = Counter(text2.lower().split())
         intersection = set(vec1.keys()) & set(vec2.keys())
@@ -218,21 +240,42 @@ class GraphRAGRetrievalEngine:
             return 0.0
         return float(numerator) / denominator
 
-    def _micro_retrieve_tree(self, query: str, tree: Dict[str, Any], top_branches: int = 2) -> List[Dict[str, Any]]:
+    def _micro_retrieve_tree(self, query: str, tree: Dict[str, Any], top_branches: int = 2, instruction: str = "") -> List[Dict[str, Any]]:
         """
-        Stage 2 (Micro): Traverses the internal tree and extracts the most relevant branches based on local semantic similarity.
+        Stage 2 (Micro): Traverses the internal tree and extracts the most relevant branches based on semantic similarity.
         """
         branches = tree.get("branches", [])
         if not branches:
             return []
             
         scored_branches = []
-        for branch in branches:
-            # Concatenate all content in the branch to score it
-            branch_text = branch.get("title", "") + " " + " ".join(item.get("text", "") for item in branch.get("content", []))
-            sim = self._cosine_similarity_text(query, branch_text)
-            scored_branches.append((sim, branch))
+        try:
+            from sentence_transformers import SentenceTransformer
+            if not hasattr(self, 'semantic_model'):
+                self.semantic_model = SentenceTransformer('BAAI/bge-large-en-v1.5', device='cpu')
+                
+            branch_texts = [b.get("title", "") + " " + " ".join(item.get("text", "") for item in b.get("content", [])) for b in branches]
             
+            # Batch encode with instruction formatting for query
+            formatted_query = f"{instruction} {query}".strip()
+            embeddings = self.semantic_model.encode([formatted_query] + branch_texts, convert_to_numpy=True)
+            q_emb = embeddings[0]
+            branch_embs = embeddings[1:]
+            
+            # Normalize and dot product
+            q_norm = q_emb / np.linalg.norm(q_emb)
+            branch_norms = branch_embs / np.linalg.norm(branch_embs, axis=1, keepdims=True)
+            similarities = np.dot(branch_norms, q_norm)
+            
+            for i, branch in enumerate(branches):
+                scored_branches.append((float(similarities[i]), branch))
+        except ImportError:
+            # Fallback to lexical
+            for branch in branches:
+                branch_text = branch.get("title", "") + " " + " ".join(item.get("text", "") for item in branch.get("content", []))
+                sim = self._cosine_similarity_text(query, branch_text)
+                scored_branches.append((sim, branch))
+
         scored_branches.sort(key=lambda x: x[0], reverse=True)
         return [b[1] for b in scored_branches[:top_branches]]
 

@@ -16,20 +16,7 @@ from src.retrieval import GraphRAGRetrievalEngine
 from src.formatter import ContextFormatter
 from src.synthesis import SemanticSynthesizer
 
-def generate_arxiv_query(search_text: str) -> str:
-    """
-    Automatically generates a robust arXiv API query from a natural language search string.
-    """
-    stop_words = {"how", "do", "what", "why", "is", "are", "for", "in", "the", "a", "an", "of", "and", "to", "with", "on", "by", "using", "about", "can", "you", "find"}
-    words = search_text.replace("'", "").replace('"', '').replace('?', '').split()
-    keywords = [w for w in words if w.lower() not in stop_words and len(w) > 2]
-    
-    if not keywords:
-        return 'all:"computer science"' # safe fallback
-        
-    # Join keywords with AND
-    query_parts = [f"all:{kw}" for kw in keywords]
-    return " AND ".join(query_parts)
+
 
 def project_query_to_model_space(q_feat: np.ndarray, params: Any, args: argparse.Namespace) -> np.ndarray:
     """
@@ -321,7 +308,8 @@ def main() -> None:
 
     # Auto-generate arXiv seed query if not provided and not using mock data
     if args.query is None and not args.mock:
-        args.query = generate_arxiv_query(args.search)
+        synthesizer = SemanticSynthesizer()
+        args.query = synthesizer.extract_arxiv_query(args.search)
         print(f"[Auto-Detect] Generated arXiv ingestion query: {args.query}")
         
     run_pipeline(args)

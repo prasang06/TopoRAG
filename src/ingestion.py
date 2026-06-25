@@ -39,15 +39,18 @@ class ArXivIngestionPipeline:
         except urllib.error.URLError as e:
             raise RuntimeError(f"Failed to connect to arXiv API: {e}") from e
 
-    def fetch_metadata(self, query: str, limit: int = 50, page_size: int = 25) -> List[Dict[str, Any]]:
+    def fetch_metadata(self, query: str, limit: int = 50, page_size: int = 25, fetch_multiplier: int = 4) -> List[Dict[str, Any]]:
         """
         Fetches arXiv papers matching a seed query using pagination and rate limiting.
+        Fetches `limit * fetch_multiplier` papers to build a large metadata pool for GAT ranking.
+        Does NOT download the heavy LaTeX trees.
         """
         all_papers: List[Dict[str, Any]] = []
         start = 0
+        target_count = limit * fetch_multiplier
 
-        while len(all_papers) < limit:
-            batch_limit = min(page_size, limit - len(all_papers))
+        while len(all_papers) < target_count:
+            batch_limit = min(page_size, target_count - len(all_papers))
             # Format query parameters
             # arXiv uses standard URL encoding
             encoded_query = urllib.parse.quote(query)
@@ -69,13 +72,17 @@ class ArXivIngestionPipeline:
                 else:
                     raise e
                     
-        papers = all_papers[:limit]
-        
-        # Asynchronously fetch and parse LaTeX e-prints for all papers
-        print(f"[Ingestion] Fetching and parsing full LaTeX trees for {len(papers)} papers...")
-        asyncio.run(self._fetch_all_trees(papers))
-        
+        papers = all_papers[:target_count]
+        print(f"[Ingestion] Fetched {len(papers)} metadata records for topological ranking.")
         return papers
+
+    def fetch_latex_for_papers(self, papers: List[Dict[str, Any]]):
+        """
+        Asynchronously fetches and parses the full LaTeX e-prints for a specific subset of papers.
+        This modifies the passed dictionary in-place by adding the 'tree' key.
+        """
+        print(f"[Ingestion] Deep fetching and parsing full LaTeX trees for {len(papers)} top-ranked papers...")
+        asyncio.run(self._fetch_all_trees(papers))
 
     async def _fetch_all_trees(self, papers: List[Dict[str, Any]]):
         async def process_paper(paper):
@@ -86,11 +93,12 @@ class ArXivIngestionPipeline:
             else:
                 paper['tree'] = generate_fallback_tree(paper.copy())
                 
-        # Run in parallel with a small concurrency limit to be nice
-        semaphore = asyncio.Semaphore(5)
+        # Run in parallel with a small concurrency limit to prevent 429 errors from arXiv
+        semaphore = asyncio.Semaphore(2)
         async def sem_process(p):
             async with semaphore:
                 await process_paper(p)
+                await asyncio.sleep(1.0) # Polite delay between requests
                 
         await asyncio.gather(*(sem_process(p) for p in papers))
 
@@ -143,8 +151,8 @@ class ArXivIngestionPipeline:
     def build_graph(
         self, 
         papers: List[Dict[str, Any]], 
-        max_features: int = 128,
-        sim_threshold: float = 0.20
+        max_features: int = 1024,
+        sim_threshold: float = 0.50
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
         Constructs the adjacency matrix (A) and feature matrix (X) from parsed papers.
@@ -154,7 +162,7 @@ class ArXivIngestionPipeline:
           2. Co-authorship: paper A and paper B share at least one author.
           3. Shared category + semantic textual similarity above `sim_threshold`.
         
-        Node features (X) are dense TF-IDF vectors computed from title and summary.
+        Node features (X) are dense semantic embeddings computed from title and summary.
         
         Returns:
             A: Adjacency matrix of shape (N, N), symmetric and unweighted (values 0 or 1).
@@ -164,9 +172,22 @@ class ArXivIngestionPipeline:
         if N == 0:
             return np.empty((0, 0)), np.empty((0, max_features))
 
-        # 1. Compute Node Features (X)
-        combined_texts = [f"{p['title']}. {p['summary']}" for p in papers]
-        X = self._build_tfidf_features(combined_texts, max_features)
+        # 1. Compute Node Features (X) using SentenceTransformers
+        try:
+            from sentence_transformers import SentenceTransformer
+            # Load specialized scientific semantic embedding model
+            model = SentenceTransformer('BAAI/bge-large-en-v1.5', device='cpu')
+            combined_texts = [f"{p['title']}[SEP]{p['summary']}" for p in papers]
+            print(f"[Ingestion] Computing dense semantic embeddings for {len(combined_texts)} papers...")
+            # Compute embeddings and return as numpy array
+            X = model.encode(combined_texts, convert_to_numpy=True)
+            # Normalize to unit length
+            norms = np.linalg.norm(X, axis=1, keepdims=True)
+            X = np.divide(X, norms, out=np.zeros_like(X), where=norms!=0)
+        except ImportError:
+            print("[Warning] sentence-transformers not installed. Falling back to simple lexical TF-IDF.")
+            combined_texts = [f"{p['title']}. {p['summary']}" for p in papers]
+            X = self._build_tfidf_features(combined_texts, max_features)
 
         # 2. Build Adjacency Matrix (A)
         A = np.zeros((N, N))
@@ -208,7 +229,7 @@ class ArXivIngestionPipeline:
                 # Check Category overlap + Text Similarity
                 shared_categories = set(paper['categories']).intersection(set(other['categories']))
                 if shared_categories:
-                    # Calculate Cosine Similarity of TF-IDF vectors
+                    # Calculate Cosine Similarity of Dense Embeddings
                     cos_sim = float(np.dot(X[i], X[j]))
                     if cos_sim >= sim_threshold:
                         A[i, j] = 1.0
@@ -219,6 +240,7 @@ class ArXivIngestionPipeline:
     def _build_tfidf_features(self, texts: List[str], max_features: int) -> np.ndarray:
         """
         Builds L2-normalized TF-IDF dense feature vectors from text strings from scratch.
+        (Deprecated in favor of semantic embeddings, kept as fallback)
         """
         # Tokenize and clean
         tokenized_texts: List[List[str]] = []
@@ -276,39 +298,53 @@ class ArXivIngestionPipeline:
         features = features / norms
         return features
 
-    def vectorize_query(self, query: str) -> np.ndarray:
+    def vectorize_query(self, query: str, instruction: str = "") -> np.ndarray:
         """
-        Vectorizes a new search query using the vocabulary and IDF values computed from the corpus.
+        Vectorizes a new search query using the semantic embedding model, or falls back to TF-IDF.
+        Prepend instruction if provided for asymmetric search models like BGE-Large.
         """
-        if not hasattr(self, 'vocab_idx') or not hasattr(self, 'idf'):
-            raise ValueError("Pipeline must build graph (and calculate TF-IDF) before vectorizing queries.")
+        try:
+            from sentence_transformers import SentenceTransformer
+            model = SentenceTransformer('BAAI/bge-large-en-v1.5', device='cpu')
             
-        word_pattern = re.compile(r'\b[a-zA-Z]{3,15}\b')
-        tokens = word_pattern.findall(query.lower())
-        
-        features = np.zeros(len(self.vocab_idx))
-        if not tokens:
-            return features
+            # Format query for asymmetric instruction-tuned model
+            formatted_query = f"{instruction} {query}".strip()
             
-        tf = Counter(tokens)
-        doc_len = len(tokens)
-        
-        for token, count in tf.items():
-            if token in self.vocab_idx:
-                idx = self.vocab_idx[token]
-                tf_val = count / doc_len
-                idf_val = self.idf[token]
-                features[idx] = tf_val * idf_val
+            # Encode and return dense semantic vector
+            q_emb = model.encode([formatted_query], convert_to_numpy=True)[0]
+            norm = np.linalg.norm(q_emb)
+            if norm > 0:
+                q_emb = q_emb / norm
+            return q_emb
+        except ImportError:
+            # Fallback to TF-IDF
+            if not hasattr(self, 'vocab_idx') or not hasattr(self, 'idf'):
+                raise ValueError("Pipeline must build graph (and calculate TF-IDF) before vectorizing queries.")
                 
-        # Normalize
-        norm = np.linalg.norm(features)
-        if norm > 0:
-            features = features / norm
+            word_pattern = re.compile(r'\b[a-zA-Z]{3,15}\b')
+            tokens = word_pattern.findall(query.lower())
             
-        return features
+            features = np.zeros(len(self.vocab_idx))
+            if not tokens:
+                return features
+                
+            tf = Counter(tokens)
+            doc_len = len(tokens)
+            
+            for token, count in tf.items():
+                if token in self.vocab_idx:
+                    idx = self.vocab_idx[token]
+                    tf_val = count / doc_len
+                    idf_val = self.idf[token]
+                    features[idx] = tf_val * idf_val
+
+            norm = np.linalg.norm(features)
+            if norm > 0:
+                features = features / norm
+            return features
 
 
-def generate_mock_data(num_nodes: int = 50, max_features: int = 128, pipeline: ArXivIngestionPipeline = None) -> Tuple[List[Dict[str, Any]], np.ndarray, np.ndarray]:
+def generate_mock_data(num_nodes: int = 50, max_features: int = 1024, pipeline: ArXivIngestionPipeline = None) -> Tuple[List[Dict[str, Any]], np.ndarray, np.ndarray]:
     """
     Generates synthetic paper metadata, adjacency matrix, and feature matrix
     for offline testing and recovery fallbacks.
@@ -379,7 +415,7 @@ def generate_mock_data(num_nodes: int = 50, max_features: int = 128, pipeline: A
     
     return papers, A, X
 
-def generate_hierarchical_mock_data(max_features: int = 128, pipeline: Optional[ArXivIngestionPipeline] = None) -> Tuple[List[Dict[str, Any]], np.ndarray, np.ndarray]:
+def generate_hierarchical_mock_data(max_features: int = 1024, pipeline: Optional[ArXivIngestionPipeline] = None) -> Tuple[List[Dict[str, Any]], np.ndarray, np.ndarray]:
     """
     Generates exactly 3 connected graph nodes with synthetic tree structures 
     for offline unit testing of hierarchical graph RAG.
