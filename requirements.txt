@@ -85,3 +85,5 @@ uvloop==0.22.1
 yarl==1.24.2
 zipp==4.1.0
 sentence-transformers
+fastapi
+uvicorn
