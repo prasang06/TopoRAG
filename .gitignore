@@ -1,0 +1,6 @@
+.venv/
+documents/
+__pycache__/
+*.png
+*.log
+.pytest_cache/
