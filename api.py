@@ -62,10 +62,10 @@ def search(request: SearchRequest):
         arxiv_query = generate_arxiv_query(request.query)
         pipeline = ArXivIngestionPipeline(delay=1.0) # Faster delay for API
         
-        # 1. Ingestion
+        # 1. Ingestion (Shallow Fetch)
         try:
             print(f"Fetching papers for query: {arxiv_query}")
-            papers = pipeline.fetch_metadata(query=arxiv_query, limit=request.limit)
+            papers = pipeline.fetch_metadata(query=arxiv_query, limit=request.limit, fetch_multiplier=4)
             if not papers:
                 raise ValueError("No papers found")
             A, X = pipeline.build_graph(papers, max_features=128, sim_threshold=0.20)
@@ -73,7 +73,7 @@ def search(request: SearchRequest):
             print(f"arXiv API failed: {e}. Falling back to mock data.")
             papers, A, X = generate_hierarchical_mock_data(max_features=128, pipeline=pipeline)
 
-        # 2. GAT Training
+        # 2. GAT Training (Metadata-Only)
         embeddings, params, metrics = train_gat_unsupervised(
             X=X, A=A, hidden_dim=64, out_dim=32, epochs=100, lr=0.01, seed=42, num_heads=4, dropout_rate=0.6
         )
@@ -86,9 +86,10 @@ def search(request: SearchRequest):
         out_graph = model.apply({'params': params}, q_graph, deterministic=True)
         q_emb = np.array(out_graph.nodes).flatten()
 
-        # 4. Retrieval
+        # 4. Retrieval (Select Top Nodes)
         retriever = GraphRAGRetrievalEngine(alpha=0.4)
         dynamic_top_k = min(15, max(5, int(request.limit * 0.6)))
+        max_neighbors = max(1, request.limit - dynamic_top_k)
         
         retrieval_results = retriever.retrieve_context(
             query_vector=q_emb,
@@ -96,27 +97,39 @@ def search(request: SearchRequest):
             adj_matrix=A,
             papers=papers,
             top_k=dynamic_top_k,
-            max_neighbors_to_include=4,
+            max_neighbors_to_include=max_neighbors,
             query=request.query
         )
+        
+        top_nodes = retrieval_results["retrieved_nodes"]
+        retrieved_indices = [node["idx"] for node in top_nodes]
+        
+        # 5. Deep Fetch (LaTeX parsing only for winners)
+        top_papers = [papers[i] for i in retrieved_indices]
+        pipeline.fetch_latex_for_papers(top_papers)
+        
+        # 6. Formatting Payload
+        formatted_results = retriever.format_payload(request.query, top_nodes, papers)
 
-        # Format Graph for Frontend (react-force-graph format)
-        retrieved_nodes_dicts = retrieval_results["retrieved_nodes"]
+        # Format Graph for Frontend
         subgraph_nodes = []
-        retrieved_indices = []
-        for node_dict in retrieved_nodes_dicts:
+        for node_dict in formatted_results["retrieved_nodes"]:
             real_idx = node_dict["idx"]
-            retrieved_indices.append(real_idx)
             p = papers[real_idx]
             role = node_dict.get("role", "Semantic Hit")
-            subgraph_nodes.append({
+            
+            node_payload = {
                 "id": p["id"],
                 "title": p.get("title", f"Paper {p['id']}"),
                 "summary": p.get("summary", ""),
                 "authors": p.get("authors", []),
                 "role": role,
-                "val": 2 if role == "Structural Bottleneck" else 1
-            })
+                "val": 2 if "Bottleneck" in role or "Bridge" in role else 1
+            }
+            if "relevant_branches" in node_dict:
+                node_payload["relevant_branches"] = node_dict["relevant_branches"]
+            
+            subgraph_nodes.append(node_payload)
 
         subgraph_links = []
         for i in retrieved_indices:
@@ -131,18 +144,11 @@ def search(request: SearchRequest):
         graph_data = {"nodes": subgraph_nodes, "links": subgraph_links}
         
         # Prepare context payload
-        payload = retrieval_results.get("payload_data", {})
-        formatted_context = ContextFormatter.format_payload(payload) if payload else "No context available."
-
-        # Prepare Tree Data (Mapping arXiv ID to its tree)
-        tree_data = {}
-        for p in papers:
-            if "tree" in p and p["tree"]:
-                tree_data[p["id"]] = p["tree"]
+        formatted_context = formatted_results["markdown_payload"]
 
         return {
             "graph": graph_data,
-            "trees": tree_data,
+            "trees": {},
             "formatted_context": formatted_context
         }
 

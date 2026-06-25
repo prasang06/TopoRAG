@@ -39,15 +39,18 @@ class ArXivIngestionPipeline:
         except urllib.error.URLError as e:
             raise RuntimeError(f"Failed to connect to arXiv API: {e}") from e
 
-    def fetch_metadata(self, query: str, limit: int = 50, page_size: int = 25) -> List[Dict[str, Any]]:
+    def fetch_metadata(self, query: str, limit: int = 50, page_size: int = 25, fetch_multiplier: int = 4) -> List[Dict[str, Any]]:
         """
         Fetches arXiv papers matching a seed query using pagination and rate limiting.
+        Fetches `limit * fetch_multiplier` papers to build a large metadata pool for GAT ranking.
+        Does NOT download the heavy LaTeX trees.
         """
         all_papers: List[Dict[str, Any]] = []
         start = 0
+        target_count = limit * fetch_multiplier
 
-        while len(all_papers) < limit:
-            batch_limit = min(page_size, limit - len(all_papers))
+        while len(all_papers) < target_count:
+            batch_limit = min(page_size, target_count - len(all_papers))
             # Format query parameters
             # arXiv uses standard URL encoding
             encoded_query = urllib.parse.quote(query)
@@ -69,13 +72,17 @@ class ArXivIngestionPipeline:
                 else:
                     raise e
                     
-        papers = all_papers[:limit]
-        
-        # Asynchronously fetch and parse LaTeX e-prints for all papers
-        print(f"[Ingestion] Fetching and parsing full LaTeX trees for {len(papers)} papers...")
-        asyncio.run(self._fetch_all_trees(papers))
-        
+        papers = all_papers[:target_count]
+        print(f"[Ingestion] Fetched {len(papers)} metadata records for topological ranking.")
         return papers
+
+    def fetch_latex_for_papers(self, papers: List[Dict[str, Any]]):
+        """
+        Asynchronously fetches and parses the full LaTeX e-prints for a specific subset of papers.
+        This modifies the passed dictionary in-place by adding the 'tree' key.
+        """
+        print(f"[Ingestion] Deep fetching and parsing full LaTeX trees for {len(papers)} top-ranked papers...")
+        asyncio.run(self._fetch_all_trees(papers))
 
     async def _fetch_all_trees(self, papers: List[Dict[str, Any]]):
         async def process_paper(paper):

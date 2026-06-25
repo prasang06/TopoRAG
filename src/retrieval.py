@@ -145,11 +145,6 @@ class GraphRAGRetrievalEngine:
                 "hybrid_score": sim + self.alpha * bc,
                 "role": role
             }
-            
-            # Stage 2 (Micro): Granular Tree Retrieval
-            if "tree" in p:
-                node_data["relevant_branches"] = self._micro_retrieve_tree(query, p["tree"])
-                
             return node_data
 
         for idx in top_k_indices:
@@ -161,16 +156,42 @@ class GraphRAGRetrievalEngine:
         # Sort the final retrieved nodes by hybrid score to feed the LLM in order of combined relevance
         final_retrieved_nodes.sort(key=lambda x: x["hybrid_score"], reverse=True)
 
-        has_trees = any("relevant_branches" in node for node in final_retrieved_nodes)
+        return {
+            "retrieved_nodes": final_retrieved_nodes
+        }
+
+    def format_payload(self, query: str, retrieved_nodes: List[Dict[str, Any]], original_papers: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """
+        Formats the retrieved nodes into a markdown payload and JSON data structure.
+        Performs micro-retrieval on the LaTeX trees if they are present in the original_papers.
+        """
+        final_nodes = []
+        semantic_count = sum(1 for n in retrieved_nodes if n["role"] == "Semantic Hit")
+        bridge_count = sum(1 for n in retrieved_nodes if "Bridge" in n["role"])
+        
+        for node in retrieved_nodes:
+            idx = node["idx"]
+            p = original_papers[idx]
+            
+            # Create a copy so we don't mutate the retrieval output
+            node_data = node.copy()
+            
+            # Stage 2 (Micro): Granular Tree Retrieval
+            if "tree" in p:
+                node_data["relevant_branches"] = self._micro_retrieve_tree(query, p["tree"])
+            
+            final_nodes.append(node_data)
+            
+        has_trees = any("relevant_branches" in n for n in final_nodes)
         
         if has_trees:
             # Format as JSON payload for LLM consumption
             payload_data = {
                 "metrics": {
-                    "semantic_hits": len(top_k_indices),
-                    "structural_bridges": len(selected_neighbor_indices)
+                    "semantic_hits": semantic_count,
+                    "structural_bridges": bridge_count
                 },
-                "nodes": final_retrieved_nodes
+                "nodes": final_nodes
             }
             payload_markdown = json.dumps(payload_data, indent=2)
         else:
@@ -178,10 +199,10 @@ class GraphRAGRetrievalEngine:
             payload_lines = [
                 "### GRAPH-RAG CONTEXT PAYLOAD",
                 "The following relevant literature and structural bridge papers have been retrieved from the citation network.",
-                f"**Retrieval Metrics**: Semantic Hits: {len(top_k_indices)} | Structural Bridges Injected: {len(selected_neighbor_indices)}\n"
+                f"**Retrieval Metrics**: Semantic Hits: {semantic_count} | Structural Bridges Injected: {bridge_count}\n"
             ]
 
-            for rank, node in enumerate(final_retrieved_nodes, 1):
+            for rank, node in enumerate(final_nodes, 1):
                 role_badge = f"[{node['role'].upper()}]"
                 authors_str = ", ".join(node['authors'])
                 categories_str = ", ".join(node['categories'])
@@ -201,7 +222,7 @@ class GraphRAGRetrievalEngine:
             payload_markdown = "\n".join(payload_lines)
 
         return {
-            "retrieved_nodes": final_retrieved_nodes,
+            "retrieved_nodes": final_nodes,
             "markdown_payload": payload_markdown,
             "payload_data": payload_data if has_trees else None
         }
