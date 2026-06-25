@@ -29,7 +29,7 @@ class ContextFormatter:
                 tag = "[SEMANTIC HIT]"
                 
             formatted_context.append(f"=== {tag} ===")
-            formatted_context.append(f"Paper: {node.get('title', 'Unknown')} (arXiv: {node.get('id', 'Unknown')})")
+            formatted_context.append(f"Paper: {node.get('title', 'Unknown')} (URL: https://arxiv.org/abs/{node.get('id', 'Unknown')})")
             
             authors = node.get("authors", [])
             if authors:
