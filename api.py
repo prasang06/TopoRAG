@@ -35,31 +35,11 @@ class SynthesisRequest(BaseModel):
     query: str
     formatted_context: str
     mode: str = "review"
-
-def generate_arxiv_query(search_text: str) -> str:
-    # 1. Clean query of punctuation that might break arXiv API
-    import re
-    clean_text = re.sub(r'[^\w\s]', '', search_text)
-    
-    # 2. Extract most meaningful keywords
-    words = clean_text.split()
-    stop_words = {"i", "want", "to", "work", "on", "open", "problem", "given", "copies", "of", "a", "an", "the", "and", "or", "whose", "that", "this", "give", "me", "resources"}
-    
-    # Filter and sort by length (heuristically, longer words are more specific jargon)
-    keywords = [w for w in words if w.lower() not in stop_words and len(w) > 4]
-    keywords = sorted(keywords, key=len, reverse=True)[:2]
-    
-    # Fallback if no keywords
-    if not keywords:
-        return 'all:"quantum"'
-        
-    query_parts = [f"all:{kw}" for kw in keywords]
-    return " AND ".join(query_parts)
-
 @app.post("/api/search")
 def search(request: SearchRequest):
     try:
-        arxiv_query = generate_arxiv_query(request.query)
+        synthesizer = SemanticSynthesizer()
+        arxiv_query = synthesizer.extract_arxiv_query(request.query)
         pipeline = ArXivIngestionPipeline(delay=1.0) # Faster delay for API
         
         # 1. Ingestion (Shallow Fetch)
@@ -68,10 +48,10 @@ def search(request: SearchRequest):
             papers = pipeline.fetch_metadata(query=arxiv_query, limit=request.limit, fetch_multiplier=4)
             if not papers:
                 raise ValueError("No papers found")
-            A, X = pipeline.build_graph(papers, max_features=128, sim_threshold=0.20)
+            A, X = pipeline.build_graph(papers, max_features=1024, sim_threshold=0.50)
         except Exception as e:
             print(f"arXiv API failed: {e}. Falling back to mock data.")
-            papers, A, X = generate_hierarchical_mock_data(max_features=128, pipeline=pipeline)
+            papers, A, X = generate_hierarchical_mock_data(max_features=1024, pipeline=pipeline)
 
         # 2. GAT Training (Metadata-Only)
         embeddings, params, metrics = train_gat_unsupervised(
@@ -80,7 +60,8 @@ def search(request: SearchRequest):
 
         # 3. Project Query
         from src.gat import GAT, dense_to_jraph
-        q_feat = pipeline.vectorize_query(request.query)
+        bge_instruction = "Represent this scientific query for retrieving relevant academic papers:"
+        q_feat = pipeline.vectorize_query(request.query, instruction=bge_instruction)
         q_graph = dense_to_jraph(q_feat.reshape(1, -1), np.zeros((1, 1)))
         model = GAT(hidden_dim=64, out_dim=32, num_heads=4, dropout_rate=0.6)
         out_graph = model.apply({'params': params}, q_graph, deterministic=True)
@@ -109,7 +90,7 @@ def search(request: SearchRequest):
         pipeline.fetch_latex_for_papers(top_papers)
         
         # 6. Formatting Payload
-        formatted_results = retriever.format_payload(request.query, top_nodes, papers)
+        formatted_results = retriever.format_payload(request.query, top_nodes, papers, instruction=bge_instruction)
 
         # Format Graph for Frontend
         subgraph_nodes = []
@@ -188,7 +169,8 @@ async def synthesize(request: SynthesisRequest):
                 stream=True,
                 options={
                     "temperature": 0.2,
-                    "num_predict": 1024,
+                    "num_predict": 4096,
+                    "num_ctx": 8192
                 }
             )
             for chunk in response:

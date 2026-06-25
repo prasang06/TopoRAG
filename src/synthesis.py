@@ -36,6 +36,50 @@ class SemanticSynthesizer:
     def __init__(self, model: str = "gemma4:31b-cloud"):
         self.model = model
         
+    def extract_arxiv_query(self, user_query: str) -> str:
+        """
+        Uses the LLM to parse a natural language query into a syntactically correct arXiv boolean search string.
+        """
+        system_prompt = """You are an expert physics research librarian. 
+Your task is to take a user's natural language research question and extract 1 to 3 core concepts, formatting them into an arXiv API search string.
+
+RULES:
+1. Output ONLY the raw search string, nothing else. No preamble, no explanation, no backticks.
+2. Format the string using 'all:' prefix and 'AND' boolean operators.
+3. If a concept is multiple words, enclose that specific concept in quotes.
+4. Keep the concepts broad enough to find papers but specific enough to be relevant. Fix any obvious spelling mistakes in the user's query.
+
+EXAMPLE INPUT: i want to learn about how quantum error correction helps in encoding data into qubits and performing operations leading into arithemetic
+EXAMPLE OUTPUT: all:"quantum error correction" AND all:qubit AND all:arithmetic
+"""
+        print(f"[Synthesizer] Asking Ollama ({self.model}) to extract arXiv search tags...")
+        try:
+            response = ollama.chat(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": f"USER QUERY: {user_query}"}
+                ]
+            )
+            query = response['message']['content'].strip()
+            
+            # Strip markdown code blocks if the LLM disobeyed
+            if query.startswith("```") and query.endswith("```"):
+                query = query.split("\n")[1:-1]
+                query = "".join(query).strip()
+            if query.startswith("`") and query.endswith("`"):
+                query = query[1:-1].strip()
+                
+            if "all:" not in query:
+                print(f"[Synthesizer] Warning: LLM produced invalid query format: {query}. Falling back to default.")
+                return 'all:"quantum"'
+                
+            print(f"[Synthesizer] Extracted optimal arXiv query: {query}")
+            return query
+        except Exception as e:
+            print(f"[Synthesizer] Failed to extract arXiv query: {e}. Falling back to default.")
+            return 'all:"quantum"'
+        
     def generate_synthesis(self, query: str, formatted_context: str, mode: str = "review") -> str:
         """
         Calls the Ollama chat API to stream the synthesis to the terminal in real-time.
