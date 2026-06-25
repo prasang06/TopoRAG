@@ -176,7 +176,7 @@ class ArXivIngestionPipeline:
         try:
             from sentence_transformers import SentenceTransformer
             # Load specialized scientific semantic embedding model
-            model = SentenceTransformer('BAAI/bge-large-en-v1.5')
+            model = SentenceTransformer('BAAI/bge-large-en-v1.5', device='cpu')
             combined_texts = [f"{p['title']}[SEP]{p['summary']}" for p in papers]
             print(f"[Ingestion] Computing dense semantic embeddings for {len(combined_texts)} papers...")
             # Compute embeddings and return as numpy array
@@ -305,7 +305,7 @@ class ArXivIngestionPipeline:
         """
         try:
             from sentence_transformers import SentenceTransformer
-            model = SentenceTransformer('BAAI/bge-large-en-v1.5')
+            model = SentenceTransformer('BAAI/bge-large-en-v1.5', device='cpu')
             
             # Format query for asymmetric instruction-tuned model
             formatted_query = f"{instruction} {query}".strip()

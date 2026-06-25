@@ -72,13 +72,15 @@ EXAMPLE OUTPUT: all:"quantum error correction" AND all:qubit AND all:arithmetic
                 
             if "all:" not in query:
                 print(f"[Synthesizer] Warning: LLM produced invalid query format: {query}. Falling back to default.")
-                return 'all:"quantum"'
+                fallback = " AND ".join([f'all:"{word}"' for word in user_query.split()[:3]])
+                return fallback
                 
             print(f"[Synthesizer] Extracted optimal arXiv query: {query}")
             return query
         except Exception as e:
             print(f"[Synthesizer] Failed to extract arXiv query: {e}. Falling back to default.")
-            return 'all:"quantum"'
+            fallback = " AND ".join([f'all:"{word}"' for word in user_query.split()[:3]])
+            return fallback
         
     def generate_synthesis(self, query: str, formatted_context: str, mode: str = "review") -> str:
         """

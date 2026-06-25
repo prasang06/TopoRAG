@@ -252,7 +252,7 @@ class GraphRAGRetrievalEngine:
         try:
             from sentence_transformers import SentenceTransformer
             if not hasattr(self, 'semantic_model'):
-                self.semantic_model = SentenceTransformer('BAAI/bge-large-en-v1.5')
+                self.semantic_model = SentenceTransformer('BAAI/bge-large-en-v1.5', device='cpu')
                 
             branch_texts = [b.get("title", "") + " " + " ".join(item.get("text", "") for item in b.get("content", [])) for b in branches]
             
