@@ -170,7 +170,7 @@ async def synthesize(request: SynthesisRequest):
                 options={
                     "temperature": 0.2,
                     "num_predict": 4096,
-                    "num_ctx": 8192
+                    "num_ctx": 4096
                 }
             )
             for chunk in response:

@@ -42,8 +42,8 @@ if [ -d ".venv" ]; then
     source .venv/bin/activate
 fi
 
-# Start uvicorn in the background
-uvicorn api:app --host 0.0.0.0 --port 8000 > /dev/null 2>&1 &
+# Start uvicorn in the background, logging to api.log
+uvicorn api:app --host 0.0.0.0 --port 8000 > api.log 2>&1 &
 BACKEND_PID=$!
 
 # Wait for backend to be healthy
@@ -64,8 +64,8 @@ if [ ! -d "node_modules" ]; then
     npm install
 fi
 
-# Start next.js in the background
-npm run dev > /dev/null 2>&1 &
+# Start next.js in the background, logging to frontend.log
+npm run dev > frontend.log 2>&1 &
 FRONTEND_PID=$!
 
 # Wait a moment for frontend to initialize
